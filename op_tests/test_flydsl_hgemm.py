@@ -18,6 +18,7 @@ Run:
 
 import argparse
 import itertools
+from unittest import mock
 
 import pandas as pd
 import torch
@@ -723,6 +724,132 @@ def test_hgemm_tuned_strides(m, n, k, dtype, layout):
     return ret
 
 
+# Split-reduce ("sr") policy, BF16 -> FP32: (m, n, k, (block_m, block_n, block_k,
+# stages, split_k, m_waves, n_waves)). The first row is the tuned gfx950
+# DeepSeek-V4.1 row; the others cover a partial last M tile, an M below one tile
+# and a second tile, wave and stage shape.
+_SPLIT_REDUCE = [
+    (384, 1024, 5120, (96, 128, 64, 3, 8, 1, 4)),
+    (200, 1024, 5120, (96, 128, 64, 3, 8, 1, 4)),
+    (1, 1024, 5120, (96, 128, 64, 3, 8, 1, 4)),
+    (384, 1024, 5120, (128, 128, 128, 2, 4, 2, 2)),
+]
+_SPLIT_REDUCE_MNK = sorted({row[:3] for row in _SPLIT_REDUCE})
+_SPLIT_REDUCE_KEYS = (
+    "block_m",
+    "block_n",
+    "block_k",
+    "stages",
+    "split_k",
+    "m_waves",
+    "n_waves",
+)
+
+
+@benchmark()
+def test_hgemm_split_reduce(m, n, k, dtype, tile):
+    from aiter.tuned_gemm import gemm_a16w16_out
+
+    config = dict(zip(_SPLIT_REDUCE_KEYS, tile), policy="sr")
+    torch.manual_seed(SEED)
+    a = torch.empty((m, k), dtype=dtype, device="cuda").uniform_(-1, 1)
+    w = torch.empty((n, k), dtype=dtype, device="cuda").uniform_(-1, 1)
+    ref = a.float() @ w.float().t()
+    guard = torch.full((m * n + 32,), 8192, dtype=dtypes.fp32, device="cuda")
+    out = guard[16:-16].view(m, n)
+    candidates = {"flydsl_sr": lambda: flydsl_hgemm(a, w, out=out, **config)}
+    tuned_out = torch.empty_like(out)
+    if (m, n, k, tile) == _SPLIT_REDUCE[0]:
+        # The tuned config row of this shape: the path the model runs.
+        candidates["tuned"] = lambda: gemm_a16w16_out(
+            a, w, tuned_out, otype=dtypes.fp32
+        )
+    ret = {"gfx": get_gfx()}
+    flops = 2 * m * n * k
+    nbytes = (m * k + n * k) * a.element_size() + m * n * out.element_size()
+    for cand, fn in candidates.items():
+        y, us = run_perftest(fn)
+        err = checkAllclose(ref, y, rtol=1e-2, atol=1e-2, msg=f"{cand}: split-reduce")
+        assert err == 0, f"{cand}: {err} elements outside the reference tolerance"
+        ret[f"{cand} us"] = us
+        ret[f"{cand} TFLOPS"] = flops / us / 1e6
+        ret[f"{cand} TB/s"] = nbytes / us / 1e6
+        ret[f"{cand} err"] = err
+    assert torch.all(guard[:16] == 8192) and torch.all(
+        guard[-16:] == 8192
+    ), "split-reduce output overrun"
+
+    # Exact binary fractions sum exactly in any order, so a missing or repeated
+    # K tile or split shows as a mismatch. Repeated launches also cross the
+    # per-launch flag rendezvous.
+    a.copy_(torch.randint(-2, 3, a.shape, device=a.device).to(dtype) / 8)
+    w.copy_(torch.randint(-2, 3, w.shape, device=w.device).to(dtype) / 8)
+    exact = a.float() @ w.float().t()
+    for _ in range(3):
+        out.fill_(float("nan"))
+        y = candidates["flydsl_sr"]()
+        err = checkAllclose(
+            exact, y, rtol=0, atol=0, msg="split-reduce K coverage", tol_err_ratio=0
+        )
+        assert err == 0, f"split-reduce K coverage mismatch: {err}"
+    # The XCD remap only changes which workgroup computes a tile, never the
+    # summation order, so a single-XCD decode must match bit for bit.
+    golden = out.clone()
+    with mock.patch(
+        "aiter.ops.flydsl.gemm_a16w16_splitk_f32.get_num_xcds", return_value=1
+    ):
+        out.fill_(float("nan"))
+        candidates["flydsl_sr"]()
+    assert torch.equal(out, golden), "split-reduce differs with NUM_XCDS=1"
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        candidates["flydsl_sr"]()
+    a.neg_()
+    exact = a.float() @ w.float().t()
+    for _ in range(3):
+        out.fill_(float("nan"))
+        graph.replay()
+        err = checkAllclose(
+            exact, out, rtol=0, atol=0, msg="split-reduce graph", tol_err_ratio=0
+        )
+        assert err == 0, f"split-reduce graph replay mismatch: {err}"
+    return ret
+
+
+def check_split_reduce_rejects():
+    config = dict(zip(_SPLIT_REDUCE_KEYS, _SPLIT_REDUCE[0][3]), policy="sr")
+    a = torch.zeros((384, 5120), dtype=dtypes.bf16, device="cuda")
+    w = torch.zeros((1024, 5120), dtype=dtypes.bf16, device="cuda")
+    for override in (
+        {"split_k": 1},
+        {"split_k": 7},
+        {"k_waves": 2},
+        {"group_m": 4},
+        {"k_stagger": 1},
+        {"b_non_temporal": True},
+        {"block_n": 96},
+        {"out_dtype": dtypes.bf16},
+        {"bias": torch.zeros(1024, device="cuda", dtype=dtypes.bf16)},
+    ):
+        try:
+            flydsl_hgemm(a, w, **(config | override))
+        except ValueError:
+            continue
+        raise AssertionError(f"split-reduce accepted {override}")
+    for x, weight in (
+        (a, w[:1000]),
+        (a[:, :5000], w[:, :5000]),
+        (a.cpu(), w.cpu()),
+    ):
+        try:
+            flydsl_hgemm(x, weight, **config)
+        except (ValueError, RuntimeError):
+            continue
+        raise AssertionError("split-reduce accepted unsupported tensors")
+    aiter.logger.info("split-reduce rejects unsupported input/configurations")
+
+
 def check_band_rejects():
     config = band_stream_config(16, 18432, 1536)
     config.pop("use_half_tile_interleaved")
@@ -830,7 +957,8 @@ def main():
         + _CONCURRENT_COPY_MNK
         + [row[:3] for row in _MEMORY_TILES]
         + _TUNED_MEMORY_MNK
-        + _BAND_MNK,
+        + _BAND_MNK
+        + _SPLIT_REDUCE_MNK,
         help="""Shape of mnk.
         e.g.:   -s 128,4096,4096
                 --mnk 32,384,7168""",
@@ -889,6 +1017,15 @@ def main():
                     if (m, n, k) in wanted
                 ],
             )
+    for dtype in args.dtype:
+        summarize(
+            f"split-reduce HGEMM {dtype} -> fp32",
+            [
+                test_hgemm_split_reduce(m, n, k, dtype, tile)
+                for m, n, k, tile in _SPLIT_REDUCE
+                if (m, n, k) in wanted
+            ],
+        )
     summarize(
         "tuned HGEMM strided inputs",
         [
@@ -899,6 +1036,7 @@ def main():
         ],
     )
     check_band_rejects()
+    check_split_reduce_rejects()
     check_hgemm_memory_options()
     check_skinny_rejects()
     check_skinny_large_weight()
