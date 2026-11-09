@@ -681,15 +681,17 @@ def flydsl_gemm(
     flydsl_gemm_kernels = _get_flydsl_gemm_kernels()
     flydsl_config = _flydsl_hgemm_kernel_params(config["kernelName"])
     skinny = flydsl_config["policy"] == flydsl_gemm_kernels.SKINNY_POLICY
+    split_reduce = flydsl_config["policy"] == flydsl_gemm_kernels.SPLIT_REDUCE_POLICY
     fused_bias = None
     if (
         not skinny
+        and not split_reduce
         and bias is not None
         and (otype is None or otype == inp.dtype)
         and bias.dtype == inp.dtype
     ):
         fused_bias = bias
-    if skinny or flydsl_config["policy"] == "bs":
+    if skinny or split_reduce or flydsl_config["policy"] == "bs":
         policy = flydsl_config["policy"]
     else:
         policy = "ht" if flydsl_config["use_half_tile_interleaved"] else "ft"

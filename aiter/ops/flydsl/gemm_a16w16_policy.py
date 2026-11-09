@@ -8,9 +8,10 @@ from dataclasses import dataclass
 
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
+from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes, get_num_xcds
 
 from .gemm_a16w16_band import band_stream_config
+from .gemm_a16w16_splitk_f32 import SPLIT_REDUCE_POLICY
 from .kernels.gemm_a16w16_gfx950 import (
     GEMM_A16W16_DTYPE_BF16,
     GEMM_A16W16_DTYPE_FP16,
@@ -19,6 +20,10 @@ from .kernels.gemm_a16w16_gfx950 import (
 )
 from .kernels.gemm_a16w16_kernel_gfx1250 import LDS_PAD_A, LDS_PAD_B
 from .kernels.gemm_a16w16_skinny_gfx950 import skinny_config_error
+from .kernels.gemm_a16w16_splitk_f32_gfx950 import (
+    splitk_f32_config_error,
+    splitk_f32_tiles,
+)
 
 __all__ = ["GemmConfigPruner", "get_flydsl_a16w16_configs"]
 
@@ -334,4 +339,57 @@ def get_flydsl_a16w16_configs(
         config = band_stream_config(m, n, k)
         if config is not None and device_props.multi_processor_count == 256:
             band_configs.append(config)
-    return valid_configs + memory_configs + skinny_configs + band_configs
+    return (
+        valid_configs
+        + memory_configs
+        + skinny_configs
+        + band_configs
+        + _split_reduce_configs(m, n, k, out_dtype, has_bias, device_props)
+    )
+
+
+def _split_reduce_configs(m, n, k, out_dtype, has_bias, device_props):
+    """FP32-output split-K candidates of the in-kernel reduction (``sr``) policy."""
+    if out_dtype != torch.float32 or has_bias:
+        return []
+    num_xcds = get_num_xcds()
+    configs = []
+    for (
+        block_m,
+        block_n,
+        block_k,
+        stages,
+        split_k,
+        (m_waves, n_waves),
+    ) in itertools.product(
+        (64, 96, 128),
+        (64, 128),
+        (64, 128),
+        (2, 3, 4),
+        (4, 8, 16),
+        ((2, 2), (1, 4), (2, 4)),
+    ):
+        if splitk_f32_config_error(
+            n, k, block_m, block_n, block_k, stages, split_k, m_waves, n_waves, num_xcds
+        ):
+            continue
+        # A launch that leaves more than half of the CUs idle cannot win.
+        tiles = splitk_f32_tiles(m, n, block_m, block_n, num_xcds)
+        if tiles * split_k < device_props.multi_processor_count // 2:
+            continue
+        configs.append(
+            {
+                "block_m": block_m,
+                "block_n": block_n,
+                "block_k": block_k,
+                "stages": stages,
+                "split_k": split_k,
+                "m_waves": m_waves,
+                "n_waves": n_waves,
+                "k_waves": 1,
+                "group_m": 0,
+                "use_half_tile_interleaved": False,
+                "policy": SPLIT_REDUCE_POLICY,
+            }
+        )
+    return configs
